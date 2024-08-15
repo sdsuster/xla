@@ -10,14 +10,7 @@ TPUs](https://cloud.google.com/tpu/). You can try it right now, for free, on a
 single Cloud TPU VM with
 [Kaggle](https://www.kaggle.com/discussions/product-feedback/369338)!
 
-Take a look at one of our [Kaggle
-notebooks](https://github.com/pytorch/xla/tree/master/contrib/kaggle) to get
-started:
-
-* [Stable Diffusion with PyTorch/XLA
-  2.0](https://github.com/pytorch/xla/blob/master/contrib/kaggle/pytorch-xla-2-0-on-kaggle.ipynb)
-* [Distributed PyTorch/XLA
-  Basics](https://github.com/pytorch/xla/blob/master/contrib/kaggle/distributed-pytorch-xla-basics-with-pjrt.ipynb)
+Please find tutorials on our [GitHub page](https://github.com/pytorch/xla) for the latest release.
 
 ## Getting Started
 
@@ -26,7 +19,7 @@ started:
 To install PyTorch/XLA a new TPU VM:
 
 ```
-pip install torch~=2.3.0 torch_xla[tpu]~=2.3.0 -f https://storage.googleapis.com/libtpu-releases/index.html
+pip install torch~=2.4.0 torch_xla[tpu]~=2.4.0 -f https://storage.googleapis.com/libtpu-releases/index.html
 ```
 
 To update your existing training loop, make the following changes:

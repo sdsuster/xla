@@ -1503,13 +1503,23 @@ at::Tensor XLANativeFunctions::empty_symint(
   // does not actually end up doing any memory initialization, we use that and
   // avoid going to CPU for it. A common PT pattern is indeed doing empty() plus
   // s_copy_().
+  XLATensorPtr xla_tensor;
   if (all_dims_static) {
-    return bridge::AtenFromXlaTensor(tensor_methods::full(
-        XlaHelpers::I64List(int_sizes.value()), 0,
-        GetXlaDeviceOrCurrent(device), at::dtype_or_default(dtype)));
+    xla_tensor = tensor_methods::full(XlaHelpers::I64List(int_sizes.value()), 0,
+                                      GetXlaDeviceOrCurrent(device),
+                                      at::dtype_or_default(dtype));
+  } else {
+    xla_tensor =
+        tensor_methods::full_symint(sym_size, 0, GetXlaDeviceOrCurrent(device),
+                                    at::dtype_or_default(dtype));
   }
-  return bridge::AtenFromXlaTensor(tensor_methods::full_symint(
-      sym_size, 0, GetXlaDeviceOrCurrent(device), at::dtype_or_default(dtype)));
+  // `tensor.to` will trigger an `empty` + `_to_copy`. In the egaer mode, the
+  // `full` will be evulated eagerly and got a replicated sharding. We should
+  // leave the sharding to be empty.
+  if (XLAGraphExecutor::Get()->UseEagerMode() && UseVirtualDevice()) {
+    xla_tensor->ClearShardingSpec();
+  }
+  return bridge::AtenFromXlaTensor(xla_tensor);
 }
 
 at::Tensor XLANativeFunctions::empty_strided_symint(
@@ -2221,14 +2231,11 @@ at::Tensor XLANativeFunctions::mse_loss_backward(const at::Tensor& grad_output,
 at::Tensor XLANativeFunctions::mul(const at::Tensor& self,
                                    const at::Tensor& other) {
   TORCH_LAZY_FN_COUNTER_TIMED_TRACING("xla::");
-  using FnType = XLATensorPtr(const XLATensorPtr&, const XLATensorPtr&,
-                              std::optional<at::ScalarType>);
-  return OpConfig::From(static_cast<FnType*>(tensor_methods::mul))
-      .add_input(self)
-      .add_input(other)
-      .cast_inputs_to_common_dtype()
-      .use_opmathtype_for_compute()
-      .run();
+  return DoBinaryOp(self, other,
+                    [&](const XLATensorPtr& xself, const XLATensorPtr& xother,
+                        at::ScalarType dtype) {
+                      return tensor_methods::mul(xself, xother, dtype);
+                    });
 }
 
 at::Tensor XLANativeFunctions::mul(const at::Tensor& self,
@@ -2745,7 +2752,9 @@ void XLANativeFunctions::_propagate_xla_data(const at::Tensor& input,
 
   // 2) Aid SPMD.
   XLATensor::ShardingSpecPtr sharding = input_tensor->sharding_spec();
-  if (sharding && sharding->sharding.type() != xla::OpSharding::UNKNOWN) {
+  // don't propagate sharding in eager mode.
+  if (!XLAGraphExecutor::Get()->UseEagerMode() && sharding &&
+      sharding->sharding.type() != xla::OpSharding::UNKNOWN) {
     tensor_methods::custom_sharding_(output_tensor,
                                      input_tensor->sharding_spec());
   }

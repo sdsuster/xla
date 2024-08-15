@@ -45,9 +45,11 @@
 #include "torch_xla/csrc/ops/device_data.h"
 #include "torch_xla/csrc/ops/xla_ops.h"
 #include "torch_xla/csrc/runtime/computation_client.h"
+#include "torch_xla/csrc/runtime/env_vars.h"
 #include "torch_xla/csrc/runtime/metrics.h"
 #include "torch_xla/csrc/runtime/metrics_analysis.h"
 #include "torch_xla/csrc/runtime/metrics_reader.h"
+#include "torch_xla/csrc/runtime/pjrt_computation_client.h"
 #include "torch_xla/csrc/runtime/pjrt_registry.h"
 #include "torch_xla/csrc/runtime/profiler.h"
 #include "torch_xla/csrc/runtime/runtime.h"
@@ -67,7 +69,10 @@
 #include "torch_xla/csrc/xla_sharding_util.h"
 #include "tsl/platform/env.h"
 #include "tsl/profiler/lib/traceme.h"
+#include "xla/pjrt/c/pjrt_c_api_gpu_extension.h"
+#include "xla/pjrt/c/pjrt_c_api_wrapper_impl.h"
 #include "xla/pjrt/distributed/distributed.h"
+#include "xla/pjrt/pjrt_api.h"
 #include "xla/python/profiler/internal/traceme_wrapper.h"
 #include "xla/service/custom_call_target_registry.h"
 #include "xla/service/hlo_parser.h"
@@ -940,22 +945,9 @@ class PyLoweringContext {
   }
 
   // Builds a HLO graph given a set of output tensors, and add unused parameters
-  // needed in xlacomputation.
+  // needed in xlacomputation for fori_loop/while_loop.
   void BuildForiLoop(std::vector<at::Tensor> tensors,
-                     std::vector<at::Tensor> input_arguments = {}) {
-    if (GetNameString() == "condctx") {
-      xla::XlaBuilder* local_builder = lowering_ctx.builder();
-      // hard-code parameter_idx to 2 to skip existing upper/lower arguments
-      int64_t parameter_idx = 2;
-      for (at::Tensor input_argument : input_arguments) {
-        xla::Shape shape =
-            xla::ShapeUtil::MakeShape(xla::PrimitiveType::S32, {1});
-        xla::XlaOp x = xla::Parameter(local_builder, parameter_idx, shape,
-                                      "UnusedArgumentsPlaceholder");
-        parameter_idx += 1;
-      }
-    }
-
+                     std::vector<at::Tensor> additional_inputs_list = {}) {
     // Get the backing XLA tensors from the output torch tensor handles
     std::vector<XLATensorPtr> xtensors =
         GetXlaTensors(tensors, /*want_all=*/true);
@@ -973,6 +965,24 @@ class PyLoweringContext {
           torch::lazy::Output(ir_value.node.get(), ir_value.index));
       lowering_ctx.AddResult(root);
     }
+
+    // add dummy parameter to cond/body xlacomputation's input for xla::while
+    // requriement
+    if ((GetNameString() == "condctx") or
+        (GetNameString() == "bodyctx" && additional_inputs_list.size() != 0)) {
+      xla::XlaBuilder* local_builder = lowering_ctx.builder();
+      int64_t parameter_idx =
+          local_builder->GetProgramShape()->parameters_size();
+      int64_t additional_inputs_list_size = additional_inputs_list.size();
+      for (int64_t i = parameter_idx; i < additional_inputs_list_size; i++) {
+        XLATensorPtr xtensor = bridge::GetXlaTensor(additional_inputs_list[i]);
+        xla::Shape shape = xtensor->shape().get();
+        xla::XlaOp x = xla::Parameter(local_builder, parameter_idx, shape,
+                                      "UnusedArgumentsPlaceholder");
+        parameter_idx += 1;
+      }
+    }
+
     computation = ConsumeValue(lowering_ctx.BuildXla());
 
     // wrap inputs of cond/body_computation
@@ -2421,6 +2431,11 @@ void InitXlaModuleBindings(py::module m) {
   });
   m.def("_get_xla_enable_device_data_cache",
         []() { return FLAGS_torch_lazy_enable_device_data_cache; });
+  m.def("_set_use_eager_mode", [](bool use_eager_mode) {
+    XLAGraphExecutor::Get()->SetUseEagerMode(use_eager_mode);
+  });
+  m.def("_get_use_eager_mode",
+        []() { return XLAGraphExecutor::Get()->UseEagerMode(); });
   m.def("_replace_xla_tensor",
         [](at::Tensor& self, const at::Tensor& source) -> at::Tensor& {
           return XLANativeFunctions::set_(self, source);
@@ -2451,6 +2466,13 @@ void InitXlaModuleBindings(py::module m) {
           return XlaCustomCall(inputs, payload, output_shapes, output_dtypes,
                                /*is_tpu=*/true);
         });
+  m.def("_has_cuda_support", []() {
+#ifdef GOOGLE_CUDA
+    return true;
+#else
+    return false;
+#endif
+  });
   m.def("_xla_gpu_custom_call",
         [](const std::vector<at::Tensor>& inputs, const std::string& payload,
            const std::vector<std::vector<int64_t>>& output_shapes,
@@ -2459,12 +2481,59 @@ void InitXlaModuleBindings(py::module m) {
           return XlaCustomCall(inputs, payload, output_shapes, output_dtypes,
                                /*is_tpu=*/false);
         });
-  m.def("_xla_register_custom_call_target",
-        [](const std::string& fn_name, const py::capsule& function_ptr,
-           const std::string& platform) {
-          XLA_REGISTER_CUSTOM_CALL_TARGET_WITH_SYM(
-              fn_name, function_ptr.get_pointer(), platform);
-        });
+  m.def("_xla_register_custom_call_target", [](const std::string& fn_name,
+                                               const py::capsule& function_ptr,
+                                               const std::string& platform) {
+    if (runtime::sys_util::GetEnvBool("XLA_USE_IFRT", false) ||
+        platform != "CUDA") {
+      XLA_ERROR() << "Custom call targets can only be registered for "
+                     "PJRT CUDA runtime."
+                  << std::endl;
+      return;
+    }
+    if (runtime::sys_util::GetEnvBool(runtime::env::kEnvPjrtDynamicPlugins,
+                                      false)) {
+      runtime::PjRtComputationClient* client =
+          dynamic_cast<runtime::PjRtComputationClient*>(
+              runtime::GetComputationClient());
+      if (!client) {
+        return;
+      }
+      const PJRT_Api* pjrt_api = client->GetPjRtCApiIfAvailable();
+      if (!pjrt_api) {
+        return;
+      }
+      // See openxla reference:
+      // https://github.com/openxla/xla/blob/b604c8d87df842002a7a8de79a434026329fbcb2/xla/pjrt/c/pjrt_c_api_gpu_test.cc#L414
+      const PJRT_Extension_Base* next =
+          reinterpret_cast<const PJRT_Extension_Base*>(
+              pjrt_api->extension_start);
+      while (next != nullptr &&
+             next->type !=
+                 PJRT_Extension_Type::PJRT_Extension_Type_Gpu_Custom_Call) {
+        next = next->next;
+      }
+      if (next == nullptr) {
+        return;
+      }
+      PJRT_Gpu_Register_Custom_Call_Args args;
+      args.struct_size = PJRT_Gpu_Register_Custom_Call_Args_STRUCT_SIZE;
+      args.function_name = fn_name.c_str();
+      args.function_name_size = fn_name.size();
+      args.api_version = 0;
+      args.custom_call_function =
+          reinterpret_cast<void*>(function_ptr.get_pointer());
+      PJRT_Error* error =
+          reinterpret_cast<const PJRT_Gpu_Custom_Call*>(next)->custom_call(
+              &args);
+      if (error) {
+        XLA_ERROR() << error->status << std::endl;
+      }
+    } else {
+      XLA_REGISTER_CUSTOM_CALL_TARGET_WITH_SYM(
+          fn_name, function_ptr.get_pointer(), platform);
+    }
+  });
   m.def("_set_xla_custom_op_name_prefix",
         [](const at::Tensor& input, const std::string& op_name_prefix,
            size_t max_call_stack_depth) -> bool {

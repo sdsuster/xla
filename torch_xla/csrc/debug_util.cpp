@@ -267,6 +267,12 @@ void DebugUtil::analyze_graph_execution_python_frame(
     return;
   }
 
+  // don't output analysis for eager mode execution/compilation
+  if (XLAGraphExecutor::Get()->UseEagerMode() &&
+      source != GraphAnalysisSource::DynamoExecution) {
+    return;
+  }
+
   if (pt_xla_debug_level <= 1 && source != GraphAnalysisSource::Compilation) {
     // for debug level <=1, only output compilation analysis in this function.
     return;
@@ -311,7 +317,7 @@ void DebugUtil::analyze_graph_execution_python_frame(
                endsWith(frames[1].file, "profiler.py")) {
       ss << debug_output_prefix
          << "  mark_step when exiting a profiler StepTrace region\n";
-    } else if ((frames[1].function == "extract_compiled_graph" ||
+    } else if ((frames[1].function == "extract_compiled_graph_helper" ||
                 frames[1].function == "extract_internal") &&
                endsWith(frames[1].file, "dynamo_bridge.py")) {
       ss << debug_output_prefix
@@ -385,6 +391,13 @@ void DebugUtil::post_compilation_analysis(
   if (pt_xla_debug_level <= 0 || !is_master_process) {
     return;
   }
+
+  // don't output analysis for eager mode execution/compilation.
+  // TODO(JackCaoG): enable this for eager+dynamo
+  if (XLAGraphExecutor::Get()->UseEagerMode()) {
+    return;
+  }
+
   static const std::string debug_output_prefix = "Post Compilation Analysis: ";
   std::stringstream ss;
   ss << "\n"
