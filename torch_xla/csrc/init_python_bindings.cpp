@@ -278,6 +278,13 @@ at::Tensor DynamicView(const at::Tensor& input,
   return bridge::AtenFromXlaTensor(std::move(result));
 }
 
+at::Tensor CastInt4(const at::Tensor& weight,
+                    const std::vector<int>& int4_weight_values) {
+  auto result = tensor_methods::cast_int4(bridge::GetXlaTensor(weight),
+                                          int4_weight_values);
+  return bridge::AtenFromXlaTensor(std::move(result));
+}
+
 at::Tensor QuantizeTensor(const at::Tensor& input,
                           const std::vector<float>& scale_list,
                           const std::vector<int>& zero_point_list,
@@ -1427,6 +1434,16 @@ void InitXlaModuleBindings(py::module m) {
     return torch::autograd::make_variable(
         result, /*requires_grad=*/input.requires_grad());
   });
+  m.def("_xla_cast_int4",
+        [](const at::Tensor& weight,
+           const std::vector<int>& int4_weight_values) -> at::Tensor {
+          at::Tensor result;
+          {
+            NoGilSection nogil;
+            result = CastInt4(weight, int4_weight_values);
+          }
+          return result;
+        });
   m.def("_xla_quantize_tensor",
         [](const at::Tensor& input, const std::vector<float>& scale_list,
            const std::vector<int>& zero_point_list, int quant_min,
@@ -1586,6 +1603,17 @@ void InitXlaModuleBindings(py::module m) {
           result_tuple[1] = new_token;
           return result_tuple;
         });
+  m.def(
+      "_xla_spmd_reduce_scatter",
+      [](const std::string& reduce_type, const at::Tensor& input, double scale,
+         int64_t scatter_dim, int64_t shard_count, const py::list& groups) {
+        std::vector<std::vector<int64_t>> replica_groups =
+            CreateReduceGroups(groups);
+        auto result = tensor_methods::reduce_scatter(
+            bridge::GetXlaTensor(input), GetReduceType(reduce_type), scale,
+            scatter_dim, shard_count, replica_groups);
+        return bridge::AtenFromXlaTensor(std::move(result));
+      });
   m.def("_xla_reduce_scatter",
         [](const std::string& reduce_type, const at::Tensor& input,
            const std::shared_ptr<torch::lazy::Value>& token, double scale,
