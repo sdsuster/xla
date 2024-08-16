@@ -355,6 +355,21 @@ std::vector<int64_t> GetOutputSizeWithScale(
   int64_t output_w = input_size[3] * (*scales_w);
   return {output_h, output_w};
 }
+// The input is in format of {N, C, D, H, W} and the output will be {D, H, W}.
+std::vector<int64_t> GetOutputSizeWithScale(
+    absl::Span<const int64_t> input_size, const std::optional<double> scales_d,
+    const std::optional<double> scales_h, const std::optional<double> scales_w,
+    const std::vector<int64_t>& output_size) {
+  XLA_CHECK(scales_d);
+  XLA_CHECK(scales_h);
+  XLA_CHECK(scales_w);
+  // Calculate the output size from input_shape and scale_factors
+  XLA_CHECK_EQ(input_size.size(), 5);
+  int64_t output_d = input_size[2] * (*scales_d);
+  int64_t output_h = input_size[3] * (*scales_h);
+  int64_t output_w = input_size[4] * (*scales_w);
+  return {output_d, output_h, output_w};
+}
 
 void CheckBinaryOpTypePromotion(const at::Tensor& out, const at::Tensor& self,
                                 const at::Tensor& other) {
@@ -3657,6 +3672,66 @@ at::Tensor XLANativeFunctions::upsample_nearest2d_backward(
     }
   }
   return bridge::AtenFromXlaTensor(tensor_methods::upsample_nearest2d_backward(
+      grad_output_tensor, torch::lazy::ToVector<int64_t>(scaled_output_size),
+      torch::lazy::ToVector<int64_t>(input_size)));
+}
+
+at::Tensor XLANativeFunctions::upsample_nearest3d(
+    const at::Tensor& self, at::IntArrayRef output_size,
+    std::optional<double> scales_d, std::optional<double> scales_h,
+    std::optional<double> scales_w) {
+  TORCH_LAZY_FN_COUNTER_TIMED_TRACING("xla::");
+  XLATensorPtr self_tensor = bridge::GetXlaTensor(self);
+  absl::Span<const int64_t> input_dims =
+      self_tensor->shape().get().dimensions();
+  std::vector<int64_t> scaled_output_size =
+      torch::lazy::ToVector<int64_t>(output_size);
+  if ((scales_d && *scales_d != 1.0) || (scales_h && *scales_h != 1.0) ||
+      (scales_w && *scales_w != 1.0)) {
+    scaled_output_size = GetOutputSizeWithScale(input_dims, scales_d, scales_h,
+                                                scales_w, scaled_output_size);
+    if (!output_size.empty()) {
+      XLA_CHECK(scaled_output_size.at(0) == output_size.at(0) &&
+                scaled_output_size.at(1) == output_size.at(1) &&
+                scaled_output_size.at(2) == output_size.at(2))
+          << "Inferred output size and output_size from upstream are different";
+    }
+  }
+  return bridge::AtenFromXlaTensor(
+      tensor_methods::upsample_nearest3d(self_tensor, scaled_output_size));
+}
+
+at::Tensor XLANativeFunctions::upsample_nearest3d_backward(
+    const at::Tensor& grad_output, at::IntArrayRef output_size,
+    at::IntArrayRef input_size, std::optional<double> scales_d,
+    std::optional<double> scales_h, std::optional<double> scales_w) {
+  TORCH_LAZY_FN_COUNTER_TIMED_TRACING("xla::");
+  XLATensorPtr grad_output_tensor = bridge::GetXlaTensor(grad_output);
+  // Only the XLA TPU backend for now implements the CustomCall required by
+  // our XLA lowering.
+  XlaDeviceType hw_type =
+      static_cast<XlaDeviceType>(grad_output_tensor->GetDevice().type());
+  if (!CheckTpuDevice(hw_type) && hw_type != XlaDeviceType::NEURON) {
+    return at::native::call_fallback_fn<
+        &xla_cpu_fallback,
+        ATEN_OP(upsample_nearest2d_backward)>::call(grad_output, output_size,
+                                                    input_size, scales_h,
+                                                    scales_w);
+  }
+  std::vector<int64_t> scaled_output_size =
+      torch::lazy::ToVector<int64_t>(output_size);
+  if ((scales_d && *scales_d != 1.0) || (scales_h && *scales_h != 1.0) ||
+      (scales_w && *scales_w != 1.0)) {
+    scaled_output_size = GetOutputSizeWithScale(input_size, scales_d, scales_h,
+                                                scales_w, scaled_output_size);
+    if (!output_size.empty()) {
+      XLA_CHECK(scaled_output_size.at(0) == output_size.at(0) &&
+                scaled_output_size.at(1) == output_size.at(1) &&
+                scaled_output_size.at(3) == output_size.at(3))
+          << "Inferred output size and output_size from upstream are different";
+    }
+  }
+  return bridge::AtenFromXlaTensor(tensor_methods::upsample_nearest3d_backward(
       grad_output_tensor, torch::lazy::ToVector<int64_t>(scaled_output_size),
       torch::lazy::ToVector<int64_t>(input_size)));
 }

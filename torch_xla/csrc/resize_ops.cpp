@@ -356,7 +356,25 @@ xla::Shape GetForwardOutputShape2d(const xla::Shape& input_shape,
       .Build();
 }
 
+xla::Shape GetForwardOutputShape3d(const xla::Shape& input_shape,
+                                   absl::Span<const int64_t> output_size) {
+  XLA_CHECK_EQ(output_size.size(), 3);
+  return ShapeBuilder(input_shape.element_type())
+      .Add(input_shape, 0)
+      .Add(input_shape, 1)
+      .Add(input_shape, 2)
+      .Add(output_size[0])
+      .Add(output_size[1])
+      .Add(output_size[2])
+      .Build();
+}
+
 xla::Shape GetBackwardOutputShape2d(const xla::Shape& input_shape,
+                                    absl::Span<const int64_t> input_size) {
+  return xla::ShapeUtil::MakeShape(input_shape.element_type(), input_size);
+}
+
+xla::Shape GetBackwardOutputShape3d(const xla::Shape& input_shape,
                                     absl::Span<const int64_t> input_size) {
   return xla::ShapeUtil::MakeShape(input_shape.element_type(), input_size);
 }

@@ -1142,6 +1142,162 @@ TEST_F(AtenXlaTensorTest, TestUpsampleNearest2DBackwardWithScale) {
   }
 }
 
+TEST_F(AtenXlaTensorTest, TestUpsampleNearest3D) {
+  struct ImageInfo {
+    int batch_size;
+    int d;
+    int h;
+    int w;
+    int ud;
+    int uh;
+    int uw;
+    int chans;
+  };
+
+  /* clang-format off */
+  std::vector<ImageInfo> inputs = {
+    {/*batch_size=*/2,/*d=*/ 5, /*h=*/5, /*w=*/5, /*ud=*/8, /*uh=*/8, /*uw=*/8, /*chans=*/2},
+    {/*batch_size=*/2,/*d=*/ 1335, /*h=*/1335, /*w=*/1335, /*ud=*/255, /*uh=*/255, /*uw=*/255, /*chans=*/3},
+    {/*batch_size=*/2,/*d=*/ 255,/*h=*/255, /*w=*/255, /*ud=*/1335, /*uh=*/1335, /*uw=*/1335, /*chans=*/3},
+    {/*batch_size=*/2,/*d=*/ 255,/*h=*/254, /*w=*/243, /*ud=*/884, /*uh=*/784, /*uw=*/214, /*chans=*/3}
+  };
+  /* clang-format on */
+
+  for (const auto& img_info : inputs) {
+    torch::Tensor input = torch::rand(
+        {img_info.batch_size, img_info.chans, img_info.h, img_info.w},
+        torch::TensorOptions(torch::kFloat));
+    ForEachDevice([&](const torch::Device& device) {
+      torch::Tensor xla_input = CopyToDevice(input, device);
+      torch::Tensor result =
+          torch::upsample_nearest3d(input, {img_info.ud, img_info.uh, img_info.uw});
+      torch::Tensor xla_result =
+          torch::upsample_nearest3d(xla_input, {img_info.ud, img_info.uh, img_info.uw});
+      AllClose(result, xla_result);
+    });
+  }
+
+  ExpectCounterNotChanged("aten::.*", cpp_test::GetIgnoredCounters());
+  ExpectCounterChanged("xla::upsample_nearest3d",
+                       cpp_test::GetIgnoredCounters());
+}
+
+// TEST_F(AtenXlaTensorTest, TestUpsampleNearest3DBackward) {
+//   int batch_size = 2;
+//   int h = 5;
+//   int w = 5;
+//   int uh = 8;
+//   int uw = 8;
+//   int chans = 2;
+//   auto testfn = [&](const std::vector<torch::Tensor>& inputs) ->
+//   torch::Tensor {
+//     return torch::upsample_nearest2d(inputs[0], {uh, uw});
+//   };
+//   ForEachDevice([&](const torch::Device& device) {
+//     TestBackward(
+//         {torch::rand({batch_size, chans, h, w},
+//                      torch::TensorOptions(torch::kFloat).requires_grad(true))},
+//         device, testfn);
+//   });
+//   ExpectCounterChanged("xla::upsample_nearest2d_backward",
+//                        cpp_test::GetIgnoredCounters());
+// }
+
+// TEST_F(AtenXlaTensorTest, TestUpsampleNearest3DWithScale) {
+//   struct ImageInfo {
+//     int batch_size;
+//     int h;
+//     int w;
+//     int chans;
+//     double scale_h;
+//     double scale_w;
+//   };
+
+//   /* clang-format off */
+//   std::vector<ImageInfo> inputs = {
+//     {/*batch_size=*/2, /*h=*/5, /*w=*/5, /*chans=*/2, /*scale_h*/2.5,
+//     /*scale_w*/3.4},
+//     {/*batch_size=*/2, /*h=*/1335, /*w=*/1335, /*chans=*/3, /*scale_h*/2.5,
+//     /*scale_w*/3.4},
+//     {/*batch_size=*/2, /*h=*/1335, /*w=*/1335, /*chans=*/3, /*scale_h*/0.5,
+//     /*scale_w*/0.5},
+//   };
+//   /* clang-format on */
+
+//   for (const auto& img_info : inputs) {
+//     torch::Tensor input = torch::rand(
+//         {img_info.batch_size, img_info.chans, img_info.h, img_info.w},
+//         torch::TensorOptions(torch::kFloat));
+//     ForEachDevice([&](const torch::Device& device) {
+//       torch::Tensor xla_input = CopyToDevice(input, device);
+//       torch::Tensor result = torch::upsample_nearest2d(
+//           input, std::nullopt,
+//           at::ArrayRef<double>{img_info.scale_h, img_info.scale_w});
+//       torch::Tensor xla_result = torch::upsample_nearest2d(
+//           xla_input, std::nullopt,
+//           at::ArrayRef<double>{img_info.scale_h, img_info.scale_w});
+//       AllClose(result, xla_result);
+//     });
+//   }
+//   ExpectCounterNotChanged("aten::.*", cpp_test::GetIgnoredCounters());
+//   ExpectCounterChanged("xla::upsample_nearest2d",
+//                        cpp_test::GetIgnoredCounters());
+// }
+
+// TEST_F(AtenXlaTensorTest, TestUpsampleNearest3DBackwardWithScale) {
+//   struct ImageInfo {
+//     int batch_size;
+//     int h;
+//     int w;
+//     int chans;
+//     double scale_h;
+//     double scale_w;
+//   };
+
+//   /* clang-format off */
+//   std::vector<ImageInfo> inputs = {
+//     {/*batch_size=*/2, /*h=*/5, /*w=*/5, /*chans=*/2, /*scale_h*/2.5,
+//     /*scale_w*/3.4},
+//     {/*batch_size=*/2, /*h=*/1335, /*w=*/1335, /*chans=*/3, /*scale_h*/2.5,
+//     /*scale_w*/3.4},
+//     {/*batch_size=*/2, /*h=*/1335, /*w=*/1335, /*chans=*/3, /*scale_h*/0.5,
+//     /*scale_w*/0.5},
+//   };
+//   /* clang-format on */
+
+//   for (const auto& img_info : inputs) {
+//     for (bool align_corners : {true, false}) {
+//       auto testfn =
+//           [&](const std::vector<torch::Tensor>& inputs) -> torch::Tensor {
+//         return torch::upsample_nearest2d(
+//             inputs[0], std::nullopt,
+//             at::ArrayRef<double>{img_info.scale_h, img_info.scale_w});
+//       };
+//       ForEachDevice([&](const torch::Device& device) {
+//         TestBackward(
+//             {torch::rand(
+//                 {img_info.batch_size, img_info.chans, img_info.h,
+//                 img_info.w},
+//                 torch::TensorOptions(torch::kFloat).requires_grad(true))},
+//             device, testfn);
+//         XlaDeviceType device_type = static_cast<XlaDeviceType>(
+//             bridge::AtenDeviceToXlaDevice(device).type());
+//         if (device_type == XlaDeviceType::TPU) {
+//           // Only lowered for TPU, fallback for CPU.
+//           ExpectCounterNotChanged("aten::.*",
+//           cpp_test::GetIgnoredCounters());
+//           ExpectCounterChanged("xla::upsample_nearest2d_backward",
+//                                cpp_test::GetIgnoredCounters());
+//           ResetCounters();
+//         } else {
+//           ExpectCounterChanged("aten::.*", cpp_test::GetIgnoredCounters());
+//           ResetCounters();
+//         }
+//       });
+//     }
+//   }
+// }
+
 TEST_F(AtenXlaTensorTest, TestUpsampleBilinear2D) {
   struct ImageInfo {
     int batch_size;

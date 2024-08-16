@@ -23,6 +23,19 @@ xla::XlaOp LowerBackward2d(const std::string& target, xla::XlaOp input,
                            const xla::Shape& output_shape, bool align_corners,
                            bool half_pixel_centers);
 
+xla::Shape GetForwardOutputShape3d(const xla::Shape& input_shape,
+                                   absl::Span<const int64_t> output_size);
+
+xla::Shape GetBackwardOutputShape3d(const xla::Shape& input_shape,
+                                    absl::Span<const int64_t> input_size);
+
+xla::XlaOp LowerForward3d(xla::XlaOp input,
+                          const xla::Shape& output_shape, bool align_corners,
+                          bool half_pixel_centers);
+
+xla::XlaOp LowerBackward3d(xla::XlaOp input,
+                           const xla::Shape& output_shape, bool align_corners,
+                           bool half_pixel_centers);
 }  // namespace resize
 }  // namespace torch_xla
 

@@ -995,6 +995,13 @@ XLATensorPtr upsample_nearest2d_backward(const XLATensorPtr& grad_output,
                                          std::vector<int64_t> output_size,
                                          std::vector<int64_t> input_size);
 
+XLATensorPtr upsample_nearest3d(const XLATensorPtr& input,
+                                std::vector<int64_t> output_size);
+
+XLATensorPtr upsample_nearest3d_backward(const XLATensorPtr& grad_output,
+                                         std::vector<int64_t> output_size,
+                                         std::vector<int64_t> input_size);
+
 XLATensorPtr var(const XLATensorPtr& input, std::vector<int64_t> dimensions,
                  double correction, bool keep_reduced_dimensions);
 

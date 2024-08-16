@@ -137,6 +137,8 @@
 #include "torch_xla/csrc/ops/upsample_bilinear2d_backward.h"
 #include "torch_xla/csrc/ops/upsample_nearest2d.h"
 #include "torch_xla/csrc/ops/upsample_nearest2d_backward.h"
+#include "torch_xla/csrc/ops/upsample_nearest3d.h"
+#include "torch_xla/csrc/ops/upsample_nearest3d_backward.h"
 #include "torch_xla/csrc/ops/user_computation.h"
 #include "torch_xla/csrc/ops/var.h"
 #include "torch_xla/csrc/ops/var_mean.h"
@@ -3193,6 +3195,21 @@ XLATensorPtr upsample_nearest2d_backward(const XLATensorPtr& grad_output,
   return grad_output->CreateFrom(torch::lazy::MakeNode<UpsampleNearestBackward>(
       grad_output->GetIrValue(), std::move(output_size),
       std::move(input_size)));
+}
+
+XLATensorPtr upsample_nearest3d(const XLATensorPtr& input,
+                                std::vector<int64_t> output_size) {
+  return input->CreateFrom(torch::lazy::MakeNode<UpsampleNearest3d>(
+      input->GetIrValue(), std::move(output_size)));
+}
+
+XLATensorPtr upsample_nearest3d_backward(const XLATensorPtr& grad_output,
+                                         std::vector<int64_t> output_size,
+                                         std::vector<int64_t> input_size) {
+  return grad_output->CreateFrom(
+      torch::lazy::MakeNode<UpsampleNearest3dBackward>(
+          grad_output->GetIrValue(), std::move(output_size),
+          std::move(input_size)));
 }
 
 XLATensorPtr alias(const XLATensorPtr& input) {
