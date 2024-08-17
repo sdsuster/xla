@@ -330,6 +330,51 @@ xla::XlaOp BuildResize3d(xla::XlaOp input, const xla::Shape& output_shape,
   if (original_input_type != input_type) {
     input = xla::ConvertElementType(input, original_input_type);
   }
+
+  xla::XlaOp d_weight;
+  d_weight = xla::Broadcast(scalar_one_op, {out_size[0], d_span_size});
+  xla::XlaOp d_weight_sum =
+      xla::Reduce(d_weight, scalar_zero_op,
+                  XlaHelpers::CreateAddComputation(input_type), {1});
+  d_weight = xla::Div(d_weight, d_weight_sum, {0});
+
+  xla::XlaOp h_weight;
+  h_weight = xla::Broadcast(scalar_one_op, {out_size[1], h_span_size});
+  xla::XlaOp h_weight_sum =
+      xla::Reduce(h_weight, scalar_zero_op,
+                  XlaHelpers::CreateAddComputation(input_type), {1});
+  h_weight = xla::Div(h_weight, h_weight_sum, {0});
+  
+  xla::XlaOp w_weight;
+  w_weight = xla::Broadcast(scalar_one_op, {out_size[2], w_span_size});
+  xla::XlaOp w_weight_sum =
+      xla::Reduce(w_weight, scalar_zero_op,
+                  XlaHelpers::CreateAddComputation(input_type), {1});
+  w_weight = xla::Div(w_weight, w_weight_sum, {0});
+  
+  xla::DotDimensionNumbers dot_dnum;
+  dot_dnum.add_lhs_contracting_dimensions(5);
+  dot_dnum.add_lhs_contracting_dimensions(3);
+  dot_dnum.add_lhs_contracting_dimensions(1);
+  dot_dnum.add_rhs_contracting_dimensions(1);
+  dot_dnum.add_rhs_contracting_dimensions(2);
+  dot_dnum.add_rhs_contracting_dimensions(3);
+  dot_dnum.add_lhs_batch_dimensions(4);
+  dot_dnum.add_lhs_batch_dimensions(2);
+  dot_dnum.add_lhs_batch_dimensions(0);
+  dot_dnum.add_rhs_batch_dimensions(5);
+  dot_dnum.add_rhs_batch_dimensions(6);
+  dot_dnum.add_rhs_batch_dimensions(7);
+  
+  xla::XlaOp dot_w_h_d_weight = xla::DotGeneral(w_weight, xla::DotGeneral(h_weight, d_weight, xla::DotDimensionNumbers()), xla::DotDimensionNumbers());
+  input = xla::DotGeneral(dot_w_h_d_weight, input, dot_dnum);
+
+  absl::InlinedVector<int64_t, 4> perm = {3, 0, 1, 2, 4};
+  input = xla::Transpose(input, perm);
+
+  if (original_input_type != input_type) {
+    input = xla::ConvertElementType(input, original_input_type);
+  }
   return input;
 }
 
@@ -362,7 +407,6 @@ xla::Shape GetForwardOutputShape3d(const xla::Shape& input_shape,
   return ShapeBuilder(input_shape.element_type())
       .Add(input_shape, 0)
       .Add(input_shape, 1)
-      .Add(input_shape, 2)
       .Add(output_size[0])
       .Add(output_size[1])
       .Add(output_size[2])
@@ -469,13 +513,26 @@ xla::XlaOp LowerForward3d(xla::XlaOp input, const xla::Shape& output_shape,
     return input + xla::Zeros(input.builder(), output_shape);
   }
 
-  std::vector<int64_t> transpose_permute({0, 4, 1, 2, 3});
+  // XLA wants NDHWC while PyTorch comes in as NCDHW, so we need to transpose,
+  // call the kernel, and transpose back.
+  std::vector<int64_t> transpose_permute({0, 4, 3, 2, 1});
   auto inv_transpose_permute = xla::InversePermutation(transpose_permute);
   xla::Shape resized_shape = xla::ShapeUtil::PermuteDimensions(transpose_permute, output_shape);
   xla::XlaOp tinput = xla::Transpose(input, transpose_permute);
 
-  xla::XlaOp resized = BuildResize3d(tinput, resized_shape, align_corners, half_pixel_centers);
-
+  xla::XlaOp resized;
+  XlaDeviceType hw_type =
+        static_cast<XlaDeviceType>(bridge::GetCurrentDevice().type());
+    if (CheckTpuDevice(hw_type) || hw_type == XlaDeviceType::NEURON) {
+      // TPU uses custom call implementation
+      resized =
+          xla::CustomCall(input.builder(), "ResizeNearest3d", {tinput}, resized_shape,
+                          GetBackendConfig(align_corners, half_pixel_centers));
+    } else {
+      resized = BuildResize3d(tinput, resized_shape, align_corners,
+                              half_pixel_centers);
+    }
+    return xla::Transpose(resized, inv_transpose_permute);
   return xla::Transpose(resized, inv_transpose_permute);
 }
 
@@ -484,27 +541,27 @@ xla::XlaOp LowerBackward3d(xla::XlaOp input, const xla::Shape& output_shape,
   static double resize_split_factor =
       torch_xla::runtime::sys_util::GetEnvDouble("XLA_RESIZE_SPLIT_FACTOR", 3.0);
   const xla::Shape& input_shape = ShapeHelper::ShapeOfXlaOp(input);
-  if (input_shape.dimensions(1) == output_shape.dimensions(1) &&
-      input_shape.dimensions(2) == output_shape.dimensions(2) &&
-      input_shape.dimensions(3) == output_shape.dimensions(3)) {
+  if (input_shape.dimensions(2) == output_shape.dimensions(2) &&
+      input_shape.dimensions(3) == output_shape.dimensions(3) &&
+      input_shape.dimensions(4) == output_shape.dimensions(4)) {
     return input;
   }
 
-  std::vector<int64_t> transpose_permute({0, 4, 1, 2, 3});
+  std::vector<int64_t> transpose_permute({0, 4, 3, 2, 1});
   auto inv_transpose_permute = xla::InversePermutation(transpose_permute);
   xla::Shape resized_shape = xla::ShapeUtil::PermuteDimensions(transpose_permute, output_shape);
   xla::XlaOp tinput = xla::Transpose(input, transpose_permute);
   std::string backend_config = GetBackendConfig(align_corners, half_pixel_centers);
 
-  if (ResizeFactor(input_shape, output_shape, 1) > resize_split_factor &&
-      ResizeFactor(input_shape, output_shape, 2) > resize_split_factor &&
-      ResizeFactor(input_shape, output_shape, 3) > resize_split_factor) {
+  if (ResizeFactor(input_shape, output_shape, 2) > resize_split_factor &&
+      ResizeFactor(input_shape, output_shape, 3) > resize_split_factor &&
+      ResizeFactor(input_shape, output_shape, 4) > resize_split_factor) {
     // If the resize is too large, do one dimension at a time.
     xla::Shape partial_shape = resized_shape;
     partial_shape.mutable_dimensions()[1] = input_shape.dimensions(1);
-    tinput = xla::CustomCall(input.builder(), "ResizeNearest", {tinput}, partial_shape, backend_config);
+    tinput = xla::CustomCall(input.builder(), "ResizeNearest3dGrad", {tinput}, partial_shape, backend_config);
   }
-  xla::XlaOp resized = xla::CustomCall(input.builder(), "ResizeNearest", {tinput}, resized_shape, backend_config);
+  xla::XlaOp resized = xla::CustomCall(input.builder(), "ResizeNearest3dGrad", {tinput}, resized_shape, backend_config);
   return xla::Transpose(resized, inv_transpose_permute);
 }
 

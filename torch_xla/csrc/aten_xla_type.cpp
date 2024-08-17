@@ -3714,8 +3714,8 @@ at::Tensor XLANativeFunctions::upsample_nearest3d_backward(
   if (!CheckTpuDevice(hw_type) && hw_type != XlaDeviceType::NEURON) {
     return at::native::call_fallback_fn<
         &xla_cpu_fallback,
-        ATEN_OP(upsample_nearest2d_backward)>::call(grad_output, output_size,
-                                                    input_size, scales_h,
+        ATEN_OP(upsample_nearest3d_backward)>::call(grad_output, output_size,
+                                                    input_size, scales_d, scales_h,
                                                     scales_w);
   }
   std::vector<int64_t> scaled_output_size =
