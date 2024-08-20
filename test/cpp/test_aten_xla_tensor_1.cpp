@@ -1288,7 +1288,7 @@ TEST_F(AtenXlaTensorTest, TestUpsampleNearest3DBackwardWithScale) {
             device, testfn);
         XlaDeviceType device_type = static_cast<XlaDeviceType>(
             bridge::AtenDeviceToXlaDevice(device).type());
-        if (device_type == XlaDeviceType::TPU) {
+        if (device_type == XlaDeviceType::TPU || device_type == XlaDeviceType::NEURON) {
           // Only lowered for TPU, fallback for CPU.
           ExpectCounterNotChanged("aten::.*",
           cpp_test::GetIgnoredCounters());

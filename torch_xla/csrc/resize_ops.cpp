@@ -11,6 +11,9 @@
 #include "xla/client/lib/constants.h"
 #include "xla/shape_util.h"
 #include "xla/util.h"
+#include "xla/client/client_library.h"
+#include "xla/client/global_data.h"
+#include "xla/stream_executor/platform_manager.h"
 
 namespace torch_xla {
 namespace resize {
@@ -157,6 +160,8 @@ xla::XlaOp BuildResize(xla::XlaOp input, const xla::Shape& output_shape,
   dimension_numbers.add_start_index_map(2);
   dimension_numbers.set_index_vector_dim(2);
   input = xla::Gather(input, concatted, dimension_numbers, slize_sizes, false);
+  const xla::Shape& output_shape4 = ShapeHelper::ShapeOfXlaOp(input);
+  std::cout << output_shape4.rank() << std::endl;
 
   xla::XlaOp w_weight;
   if (is_kernel_bilinear) {
@@ -219,6 +224,128 @@ xla::XlaOp BuildResize(xla::XlaOp input, const xla::Shape& output_shape,
   }
   return input;
 }
+
+xla::XlaOp GeneralCompileGrad(xla::XlaOp input, const xla::Shape& output_shape,
+                        bool align_corners, bool half_pixel_centers) {
+
+  xla::XlaBuilder* builder = input.builder();
+
+  const xla::Shape& grad_shape = ShapeHelper::ShapeOfXlaOp(input);
+  xla::PrimitiveType grad_type = grad_shape.element_type();
+
+  xla::XlaOp scalar_one_op =
+      xla::ConvertElementType(xla::ConstantR0(builder, 2), grad_type);
+  xla::XlaOp scalar_zero_op =
+      xla::ConvertElementType(xla::ConstantR0(builder, 0), grad_type);
+
+  int64_t batch = grad_shape.dimensions(0);
+  int64_t channels = grad_shape.dimensions(3);
+
+  std::vector<int64_t> out_size = {output_shape.dimensions(1),
+                              output_shape.dimensions(2)};
+  std::vector<int64_t> in_size = {grad_shape.dimensions(1),
+                              grad_shape.dimensions(2)};
+
+  int64_t h_span_size = 1;
+  xla::XlaOp h_weight;
+  h_weight = xla::Broadcast(scalar_one_op, {in_size[0], h_span_size});
+  xla::XlaOp h_weight_sum =
+      xla::Reduce(h_weight, scalar_zero_op,
+                  XlaHelpers::CreateAddComputation(grad_type), {1});
+  h_weight = xla::Div(h_weight, h_weight_sum, {0});
+  
+  int64_t w_span_size = 1;
+  xla::XlaOp w_weight;
+  w_weight = xla::Broadcast(scalar_one_op, {in_size[1], w_span_size});
+  xla::XlaOp w_weight_sum =
+      xla::Reduce(w_weight, scalar_zero_op,
+                  XlaHelpers::CreateAddComputation(grad_type), {1});
+  w_weight = xla::Div(w_weight, w_weight_sum, {0});
+
+  xla::XlaOp dot_weights = xla::DotGeneral(w_weight, h_weight, xla::DotDimensionNumbers());
+
+  // Reverse the forward direction's DotGeneral.
+  // `dot_weights` has dimensions
+  //   {out_size[1], kernel_width, out_size[0], kernel_height}
+  // Before this step `grad` has dimensions
+  //   {batch, out_size[0], out_size[1], channel}
+  // After this step `grad` has dimensions
+  //   {out_size[0], out_size[1], kernel_width, kernel_height, batch, channel}
+  xla::DotDimensionNumbers dot_dnum;
+  dot_dnum.add_lhs_batch_dimensions(2);
+  dot_dnum.add_lhs_batch_dimensions(0);
+  dot_dnum.add_rhs_batch_dimensions(1);
+  dot_dnum.add_rhs_batch_dimensions(2);
+  input = xla::DotGeneral(dot_weights, input, dot_dnum);
+  int dot_out_size_height_index = 0;
+  int dot_out_size_width_index = 1;
+  int dot_kernel_width_index = 2;
+  int dot_kernel_height_index = 3;
+  int dot_batch_index = 4;
+  int dot_channel_index = 5;
+
+  // Transpose DotGeneral result's dimensions to be the same order as the
+  // forward direction's input to DotGeneral. This is needed because the
+  // backward's Scatter's input has the same order as the forward's Gather
+  // output.
+  // After this step `grad` has dimensions
+  //   {batch, kernel_height, kernel_width, channel, out_size[0], out_size[1]}
+  absl::InlinedVector<int64_t, 4> perm = {
+      dot_batch_index,   dot_kernel_height_index,   dot_kernel_width_index,
+      dot_channel_index, dot_out_size_height_index, dot_out_size_width_index};
+  input = xla::Transpose(input, perm);
+
+  // A Scatter reverses the forward op's Gather. Gather can be thought of as a
+  // matrix-vector multiply where each row has one 1 and the rest 0. The
+  // reversing Scatter does the transposed matrix-vector multiply.
+  // `scatter_dest_zeros` has dimensions
+  //   {batch, in_size[0], in_size[1], channel}
+  // `concatted` has dimensions {out_size[0], out_size[1], image_indices}
+  // `update_window_dims` are {batch, kernel_height, kernel_width, channel}
+  // `scatter_dims_to_operand_dims` are {kernel_height, kernel_width}
+  // `index_vector_dim` is the index of image_indices in `concatted`.
+  // After this step `grad` has dimensions
+  //   {batch, in_size[0], out_size[0], channel}
+  absl::InlinedVector<int64_t, 4> slice_sizes = {batch, out_size[0], out_size[1],
+                                                channels};
+  xla::ScatterDimensionNumbers dimension_numbers;
+  dimension_numbers.add_update_window_dims(0);
+  dimension_numbers.add_update_window_dims(1);
+  dimension_numbers.add_update_window_dims(2);
+  dimension_numbers.add_update_window_dims(3);
+  dimension_numbers.add_scatter_dims_to_operand_dims(1);
+  dimension_numbers.add_scatter_dims_to_operand_dims(2);
+  dimension_numbers.set_index_vector_dim(2);
+  xla::XlaOp scatter_dest_zeros = xla::Broadcast(
+      xla::ConvertElementType(xla::ConstantR0(builder, 0), grad_type), slice_sizes);
+  // A matrix-vector multiply's combining function is Add.
+  // xla::XlaComputation combiner_computation = MakeAddCombiner(grad_type);
+  xla::XlaComputation combiner_computation = XlaHelpers::CreateAddComputation(grad_type);
+
+  // to scale the indices based on 1/(resized ratio)
+  xla::XlaOp h_scale_op = xla::ConvertElementType(xla::ConstantR0(builder, out_size[0] / static_cast<float>(in_size[0])), grad_type);
+  xla::XlaOp w_scale_op = xla::ConvertElementType(xla::ConstantR0(builder, out_size[1] / static_cast<float>(in_size[1])), grad_type);
+  xla::XlaOp h_span_start = xla::Iota(builder, xla::ShapeUtil::MakeShape(grad_type, {in_size[0]}), 0);
+  h_span_start = xla::Mul(h_span_start, h_scale_op);
+  h_span_start = xla::Floor(h_span_start);
+  xla::XlaOp w_span_start = xla::Iota(builder, xla::ShapeUtil::MakeShape(grad_type, {in_size[1]}), 0);
+  w_span_start = xla::Mul(w_span_start, w_scale_op);
+  w_span_start = xla::Floor(w_span_start);
+  xla::XlaOp broadcasted_h_span_start = xla::BroadcastInDim(h_span_start, {in_size[0], in_size[1], 1}, {0});
+  xla::XlaOp broadcasted_w_span_start = xla::BroadcastInDim(w_span_start, {in_size[0], in_size[1], 1}, {1});
+  xla::XlaOp concatted = xla::ConvertElementType(
+      xla::ConcatInDim(builder, {broadcasted_h_span_start, broadcasted_w_span_start}, 2), xla::S32);
+
+  input = xla::Scatter(scatter_dest_zeros, /*scatter_indices=*/concatted, input,
+                      combiner_computation, dimension_numbers,
+                      /*indices_are_sorted=*/false, /*unique_indices=*/false);
+
+  // if (!is_kernel_bilinear && original_grad_type != grad_type) {
+  //   grad = xla::ConvertElementType(grad, original_grad_type);
+  // }
+  return input;
+}
+
 
 xla::XlaOp BuildResize3d(xla::XlaOp input, const xla::Shape& output_shape,
                          bool align_corners, bool half_pixel_centers) {
@@ -378,6 +505,151 @@ xla::XlaOp BuildResize3d(xla::XlaOp input, const xla::Shape& output_shape,
   return input;
 }
 
+// Reference https://github.com/lgeiger/tensorflow/blob/74cb43c6e9821cfbff259f243d6d31f9c10308bb/tensorflow/compiler/tf2xla/kernels/image_resize_ops.cc#L564
+xla::XlaOp BuildResizeNearest3dGrad(xla::XlaOp input, const xla::Shape& output_shape,
+                        bool align_corners, bool half_pixel_centers) {
+
+  xla::XlaBuilder* builder = input.builder();
+
+  const xla::Shape& grad_shape = ShapeHelper::ShapeOfXlaOp(input);
+  xla::PrimitiveType grad_type = grad_shape.element_type();
+
+  xla::XlaOp scalar_one_op =
+      xla::ConvertElementType(xla::ConstantR0(builder, 1), grad_type);
+  xla::XlaOp scalar_half_op =
+      xla::ConvertElementType(xla::ConstantR0(builder, 0.5), grad_type);
+  xla::XlaOp scalar_zero_op =
+      xla::ConvertElementType(xla::ConstantR0(builder, 0), grad_type);
+
+  int64_t batch = grad_shape.dimensions(0);
+  int64_t channels = grad_shape.dimensions(4);
+
+  std::vector<int64_t> out_size = {output_shape.dimensions(1),
+                              output_shape.dimensions(2),
+                              output_shape.dimensions(3)};
+  std::vector<int64_t> in_size = {grad_shape.dimensions(1),
+                              grad_shape.dimensions(2),
+                              grad_shape.dimensions(3)};
+  int64_t d_span_size = 1;
+  xla::XlaOp d_weight;
+  d_weight = xla::Broadcast(scalar_one_op, {in_size[0], d_span_size});
+  xla::XlaOp d_weight_sum =
+      xla::Reduce(d_weight, scalar_zero_op,
+                  XlaHelpers::CreateAddComputation(grad_type), {1});
+  d_weight = xla::Div(d_weight, d_weight_sum, {0});
+
+  int64_t h_span_size = 1;
+  xla::XlaOp h_weight;
+  h_weight = xla::Broadcast(scalar_one_op, {in_size[1], h_span_size});
+  xla::XlaOp h_weight_sum =
+      xla::Reduce(h_weight, scalar_zero_op,
+                  XlaHelpers::CreateAddComputation(grad_type), {1});
+  h_weight = xla::Div(h_weight, h_weight_sum, {0});
+  
+  int64_t w_span_size = 1;
+  xla::XlaOp w_weight;
+  w_weight = xla::Broadcast(scalar_one_op, {in_size[2], w_span_size});
+  xla::XlaOp w_weight_sum =
+      xla::Reduce(w_weight, scalar_zero_op,
+                  XlaHelpers::CreateAddComputation(grad_type), {1});
+  w_weight = xla::Div(w_weight, w_weight_sum, {0});
+
+  xla::XlaOp dot_weights = xla::DotGeneral(w_weight, xla::DotGeneral(h_weight, d_weight, xla::DotDimensionNumbers()), xla::DotDimensionNumbers());
+
+
+
+  // Reverse dot weights.
+  xla::DotDimensionNumbers dot_dnum;
+  dot_dnum.add_lhs_batch_dimensions(4);
+  dot_dnum.add_lhs_batch_dimensions(2);
+  dot_dnum.add_lhs_batch_dimensions(0);
+  dot_dnum.add_rhs_batch_dimensions(1);
+  dot_dnum.add_rhs_batch_dimensions(2);
+  dot_dnum.add_rhs_batch_dimensions(3);
+  input = xla::DotGeneral(dot_weights, input, dot_dnum);
+  int dot_out_size_depth_index = 0;
+  int dot_out_size_height_index = 1;
+  int dot_out_size_width_index = 2;
+  int dot_kernel_width_index = 3;
+  int dot_kernel_height_index = 4;
+  int dot_kernel_depth_index = 5;
+  int dot_batch_index = 6;
+  int dot_channel_index = 7;
+
+  // Transpose DotGeneral result's dimensions to be the same order as the
+  // forward direction's input to DotGeneral. This is needed because the
+  // backward's Scatter's input has the same order as the forward's Gather
+  // output.
+  // After this step `grad` has dimensions
+  //   {batch, kernel_height, kernel_width, channel, out_size[0], out_size[1], out_size[2]}
+  absl::InlinedVector<int64_t, 4> perm = {
+      dot_batch_index, dot_kernel_depth_index,   dot_kernel_height_index,   dot_kernel_width_index,
+      dot_channel_index, dot_out_size_depth_index, dot_out_size_height_index, dot_out_size_width_index};
+  input = xla::Transpose(input, perm);
+
+  // A Scatter reverses the forward op's Gather. Gather can be thought of as a
+  // matrix-vector multiply where each row has one 1 and the rest 0. The
+  // reversing Scatter does the transposed matrix-vector multiply.
+  absl::InlinedVector<int64_t, 5> slice_sizes = {batch, out_size[0], out_size[1], out_size[2],
+                                                channels};
+  xla::ScatterDimensionNumbers dimension_numbers;
+  dimension_numbers.add_update_window_dims(0);
+  dimension_numbers.add_update_window_dims(1);
+  dimension_numbers.add_update_window_dims(2);
+  dimension_numbers.add_update_window_dims(3);
+  dimension_numbers.add_update_window_dims(4);
+  dimension_numbers.add_scatter_dims_to_operand_dims(1);
+  dimension_numbers.add_scatter_dims_to_operand_dims(2);
+  dimension_numbers.add_scatter_dims_to_operand_dims(3);
+  dimension_numbers.set_index_vector_dim(3);
+  xla::XlaOp scatter_dest_zeros = xla::Broadcast(
+      xla::ConvertElementType(xla::ConstantR0(builder, 0), grad_type), slice_sizes);
+
+  // A matrix-vector multiply's combining function is Add.
+  // xla::XlaComputation combiner_computation = MakeAddCombiner(grad_type);
+  xla::XlaComputation combiner_computation = XlaHelpers::CreateAddComputation(grad_type);
+
+  // to scale the indices based on 1/(resized ratio) Basically its Reversed Upscale..
+  xla::XlaOp d_scale_op = xla::ConvertElementType(xla::ConstantR0(builder, out_size[0] / static_cast<float>(in_size[0])), grad_type);
+  xla::XlaOp h_scale_op = xla::ConvertElementType(xla::ConstantR0(builder, out_size[1] / static_cast<float>(in_size[1])), grad_type);
+  xla::XlaOp w_scale_op = xla::ConvertElementType(xla::ConstantR0(builder, out_size[2] / static_cast<float>(in_size[2])), grad_type);
+
+  xla::XlaOp d_span_start = xla::Iota(builder, xla::ShapeUtil::MakeShape(grad_type, {in_size[0]}), 0);
+  if (half_pixel_centers) {
+    d_span_start = xla::Add(d_span_start, scalar_half_op);
+  }
+  xla::XlaOp d_sample_f = xla::Mul(d_span_start, d_scale_op);
+  d_span_start = align_corners ? xla::Round(d_sample_f) : xla::Floor(d_sample_f);
+
+  xla::XlaOp h_span_start = xla::Iota(builder, xla::ShapeUtil::MakeShape(grad_type, {in_size[1]}), 0);
+  if (half_pixel_centers) {
+    h_span_start = xla::Add(h_span_start, scalar_half_op);
+  }
+  xla::XlaOp h_sample_f = xla::Mul(h_span_start, h_scale_op);
+  h_span_start = align_corners ? xla::Round(h_sample_f) : xla::Floor(h_sample_f);
+
+  xla::XlaOp w_span_start = xla::Iota(builder, xla::ShapeUtil::MakeShape(grad_type, {in_size[2]}), 0);
+  if (half_pixel_centers) {
+    w_span_start = xla::Add(w_span_start, scalar_half_op);
+  }
+  xla::XlaOp w_sample_f = xla::Mul(w_span_start, w_scale_op);
+  w_span_start = align_corners ? xla::Round(w_sample_f) : xla::Floor(w_sample_f);
+
+  xla::XlaOp broadcasted_d_span_start = xla::BroadcastInDim(d_span_start, {in_size[0], in_size[1], in_size[2], 1}, {0});
+  xla::XlaOp broadcasted_h_span_start = xla::BroadcastInDim(h_span_start, {in_size[0], in_size[1], in_size[2], 1}, {1});
+  xla::XlaOp broadcasted_w_span_start = xla::BroadcastInDim(w_span_start, {in_size[0], in_size[1], in_size[2], 1}, {2});
+
+  xla::XlaOp concatted = xla::ConvertElementType(
+      xla::ConcatInDim(builder, {broadcasted_d_span_start, broadcasted_h_span_start, broadcasted_w_span_start}, 3), xla::S32);
+
+  // Reverse xla::Gather(..)
+  input = xla::Scatter(scatter_dest_zeros, /*scatter_indices=*/concatted, input,
+                      combiner_computation, dimension_numbers,
+                      /*indices_are_sorted=*/false, /*unique_indices=*/false);
+
+  return input;
+}
+
 std::string GetBackendConfig(bool align_corners, bool half_pixel_centers) {
   return absl::StrCat("\"", align_corners, half_pixel_centers, "\"");
 }
@@ -495,9 +767,16 @@ xla::XlaOp LowerBackward2d(const std::string& target, xla::XlaOp input,
     tinput = xla::CustomCall(input.builder(), target, {tinput}, partial_shape,
                              backend_config);
   }
-  xla::XlaOp resised = xla::CustomCall(input.builder(), target, {tinput},
-                                       resized_shape, backend_config);
-  return xla::Transpose(resised, inv_transpose_permute);
+  // xla::XlaOp resized = xla::CustomCall(input.builder(), target, {tinput},
+  //                                      resized_shape, backend_config);
+  xla::XlaOp resized;
+  if (target == "ResizeNearestGrad") {
+    resized = GeneralCompileGrad(tinput, resized_shape, align_corners, half_pixel_centers);
+  } else {
+    resized = xla::CustomCall(input.builder(), target, {tinput},
+                                        resized_shape, backend_config);
+  }
+  return xla::Transpose(resized, inv_transpose_permute);
 }
 
 xla::XlaOp LowerForward3d(xla::XlaOp input, const xla::Shape& output_shape,
@@ -520,19 +799,8 @@ xla::XlaOp LowerForward3d(xla::XlaOp input, const xla::Shape& output_shape,
   xla::Shape resized_shape = xla::ShapeUtil::PermuteDimensions(transpose_permute, output_shape);
   xla::XlaOp tinput = xla::Transpose(input, transpose_permute);
 
-  xla::XlaOp resized;
-  XlaDeviceType hw_type =
-        static_cast<XlaDeviceType>(bridge::GetCurrentDevice().type());
-    if (CheckTpuDevice(hw_type) || hw_type == XlaDeviceType::NEURON) {
-      // TPU uses custom call implementation
-      resized =
-          xla::CustomCall(input.builder(), "ResizeNearest3d", {tinput}, resized_shape,
-                          GetBackendConfig(align_corners, half_pixel_centers));
-    } else {
-      resized = BuildResize3d(tinput, resized_shape, align_corners,
+  xla::XlaOp resized = BuildResize3d(tinput, resized_shape, align_corners,
                               half_pixel_centers);
-    }
-    return xla::Transpose(resized, inv_transpose_permute);
   return xla::Transpose(resized, inv_transpose_permute);
 }
 
@@ -551,7 +819,6 @@ xla::XlaOp LowerBackward3d(xla::XlaOp input, const xla::Shape& output_shape,
   auto inv_transpose_permute = xla::InversePermutation(transpose_permute);
   xla::Shape resized_shape = xla::ShapeUtil::PermuteDimensions(transpose_permute, output_shape);
   xla::XlaOp tinput = xla::Transpose(input, transpose_permute);
-  std::string backend_config = GetBackendConfig(align_corners, half_pixel_centers);
 
   if (ResizeFactor(input_shape, output_shape, 2) > resize_split_factor &&
       ResizeFactor(input_shape, output_shape, 3) > resize_split_factor &&
@@ -559,9 +826,9 @@ xla::XlaOp LowerBackward3d(xla::XlaOp input, const xla::Shape& output_shape,
     // If the resize is too large, do one dimension at a time.
     xla::Shape partial_shape = resized_shape;
     partial_shape.mutable_dimensions()[1] = input_shape.dimensions(1);
-    tinput = xla::CustomCall(input.builder(), "ResizeNearest3dGrad", {tinput}, partial_shape, backend_config);
+    tinput = BuildResizeNearest3dGrad(tinput, partial_shape, align_corners, half_pixel_centers);
   }
-  xla::XlaOp resized = xla::CustomCall(input.builder(), "ResizeNearest3dGrad", {tinput}, resized_shape, backend_config);
+  xla::XlaOp resized = BuildResizeNearest3dGrad(tinput, resized_shape, align_corners, half_pixel_centers);
   return xla::Transpose(resized, inv_transpose_permute);
 }
 

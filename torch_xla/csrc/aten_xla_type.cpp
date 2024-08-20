@@ -3727,7 +3727,7 @@ at::Tensor XLANativeFunctions::upsample_nearest3d_backward(
     if (!output_size.empty()) {
       XLA_CHECK(scaled_output_size.at(0) == output_size.at(0) &&
                 scaled_output_size.at(1) == output_size.at(1) &&
-                scaled_output_size.at(3) == output_size.at(3))
+                scaled_output_size.at(2) == output_size.at(2))
           << "Inferred output size and output_size from upstream are different";
     }
   }
