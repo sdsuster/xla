@@ -160,8 +160,6 @@ xla::XlaOp BuildResize(xla::XlaOp input, const xla::Shape& output_shape,
   dimension_numbers.add_start_index_map(2);
   dimension_numbers.set_index_vector_dim(2);
   input = xla::Gather(input, concatted, dimension_numbers, slize_sizes, false);
-  const xla::Shape& output_shape4 = ShapeHelper::ShapeOfXlaOp(input);
-  std::cout << output_shape4.rank() << std::endl;
 
   xla::XlaOp w_weight;
   if (is_kernel_bilinear) {
